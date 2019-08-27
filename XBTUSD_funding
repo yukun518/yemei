@@ -1,0 +1,447 @@
+import json,os,ssl
+import pandas as pd
+import pymongo
+import numpy as np
+import re,datetime,time
+import requests,sys
+
+
+from bson.objectid import ObjectId
+from pyecharts import options as opts
+from pyecharts.charts import Bar, Grid, Line, Kline, Page, Scatter
+
+os.environ['TF_CPP_MIN_LOG_LEVEL']='2'
+pd.set_option('display.max_columns',None)
+
+upColor = '#2E8B57'
+downColor = '#FF0000'
+linecolor1 = ''
+linecolor2 = ''
+last_fetch_time=datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # 获取今天的时间  小时
+DATA_STARTTIME='2016-06-04 5:00:00'
+FUND_STARTTIME='2016-06-04 5:00:00'
+TIMEZONE=7
+
+symbol='XBTUSD'
+
+timeperiod = ['1d','4h','1h','15m'][2]
+db_name='BitmexKun'
+headers={
+'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
+             ' Chrome/75.0.3770.100 Safari/537.36'
+}
+
+def get_data(symbol,timeperiod,start_time=''):
+    '''
+    :param symbol: 合约名称
+            last_time:开始时间
+    :param timeperiod:  获取合约的周期,1d,1h等
+    :return: 返回获得数据，格式是json转换为python list
+    '''
+    if start_time:
+        k_data_url ="https://www.bitmex.com/api/v1/trade/bucketed?binSize=%s&partial=false&symbol=%s" \
+                    "&count=750&startTime=%s" % (timeperiod, symbol, start_time)
+    else:
+        k_data_url='https://www.bitmex.com/api/v1/trade/bucketed?binSize=%s&partial=false' \
+           '&symbol=%s&reverse=false&count=750&startTime=%s'%(timeperiod,symbol,DATA_STARTTIME)
+    response = requests.get(k_data_url, headers=headers)
+    r = response.json()
+    # print(r)
+    # print(type(r))
+    return r
+def get_funding(start_time=''):
+    if start_time:
+        k_data_url ="https://www.bitmex.com/api/v1/funding?&filter=%7B%22symbol%22%3A%20%22XBTUSD%22%7D&" \
+                    "count=500&reverse=false&startTime={}" .format (start_time)
+    else:
+        k_data_url = 'https://www.bitmex.com/api/v1/funding?&filter=%7B%22symbol%22%3A%20%22XBTUSD%22%7D&' \
+                     'count=500&reverse=false&startTime={}'.format(FUND_STARTTIME)
+    response = requests.get(k_data_url, headers=headers)
+    r = response.json()
+    return r
+def get_lasttime(cursor):
+    '''
+    获取数据库的所有元素
+    :param cursor: 数据元素返回的列表
+    :return: 返回数据最后一条的时间
+    '''
+    if cursor:
+        data = list(cursor)
+    else:
+        data = []
+    try:
+        ttime = data[-1]['timestamp']
+    except Exception as e:
+        ttime = ""
+    return ttime
+
+def change_time(s):
+    '''
+    抓取的时间 增加7小时，就是tradingview上显示的了。
+    :param s:
+    :return:
+    '''
+    pattern = re.compile(r'(.*)T(.*).000Z')
+    m = ' '.join(list(pattern.findall(s)[0]))
+    md=datetime.datetime.strptime(m,'%Y-%m-%d %H:%M:%S')+datetime.timedelta(hours=TIMEZONE)
+    mt=datetime.datetime.strftime(md,'%Y-%m-%d %H:%M:%S')
+    return mt
+
+def change_time_fund(s):
+    pattern = re.compile(r'(.*)T(.*).000Z')
+    m = ' '.join(list(pattern.findall(s)[0]))
+    md = datetime.datetime.strptime(m, '%Y-%m-%d %H:%M:%S') + datetime.timedelta(hours=(TIMEZONE+1))
+    mt = datetime.datetime.strftime(md, '%Y-%m-%d %H:%M:%S')
+    return mt
+
+def dele_time(s):
+    if s:
+        md = datetime.datetime.strptime(s, '%Y-%m-%d %H:%M:%S') - datetime.timedelta(hours=(TIMEZONE-1))
+        mt = datetime.datetime.strftime(md, '%Y-%m-%d %H:%M:%S')
+        return  mt
+    else:
+        return ''
+
+def equal_time(sd,ed):
+    s_time=datetime.datetime.strptime(sd, '%Y-%m-%d %H:%M:%S')
+    if ed:
+        e_time=datetime.datetime.strptime(ed, '%Y-%m-%d %H:%M:%S')
+        return (s_time > e_time)
+    else:
+        return True
+
+# print(equal_time('2019-08-22 20:00:00','2019-08-22 04:00:00'))
+# sys.exit('112')
+def save_xbt1h(db_name,symbol):
+    print('开始更新合约%s'%symbol)
+    client=pymongo.MongoClient(host='127.0.0.1',port=27017)
+    db_data=client[db_name]
+    db_collection=db_data[''.join([symbol,timeperiod])]
+    cursor = db_collection.find()
+    last_time=get_lasttime(cursor)
+    start_time=dele_time(last_time)
+    data=get_data(symbol, timeperiod,start_time)
+
+    pd_df=[]
+    while data !=None:
+        for d in data:
+            ttime = change_time(d['timestamp'])
+            if equal_time(ttime,last_time)==False:
+                continue
+            else:
+                k_data={
+                    'timestamp':ttime,
+                    'open':d['open'],
+                    'close':d['close'],
+                    'high':d['high'],
+                    'low':d['low']
+                }
+                db_collection.insert_one(k_data)
+                pd_df.append(k_data)
+        if len(data)>=750:
+            last_time = ttime
+            print(ttime)
+            start_time=dele_time(ttime)
+            data=get_data(symbol,timeperiod,start_time)
+            time.sleep(1)
+        else:
+            break
+    pd.DataFrame(pd_df).to_excel('./data/%s_%s.xlsx'%(symbol,timeperiod))
+    print('更新完成')
+def save_funding(db_name):
+    #根据biemex的资金费率时间 来统一
+    print('开始更新资金费率')
+    client = pymongo.MongoClient(host='127.0.0.1', port=27017)
+    db_data = client[db_name]
+    db_collection = db_data['XBTfunding']
+    cursor = db_collection.find()
+    last_time = get_lasttime(cursor)
+    ttime=last_time
+    start_time = last_time
+    data = get_funding(start_time)
+
+    pd_df = []
+    while data != None:
+        for d in data:
+            ttime = change_time_fund(d['timestamp'])
+            if equal_time(ttime, last_time) == False:
+                continue
+            else:
+                k_data = {
+                    'timestamp': ttime,
+                    'fundingRate': d['fundingRate'],
+                    'fundingRateDaily': d['fundingRateDaily']
+                }
+                db_collection.insert_one(k_data)
+                pd_df.append(k_data)
+        if len(data) >= 500:
+            last_time = ttime
+            print(ttime)
+            start_time = ttime
+            data = get_funding( start_time)
+            time.sleep(1)
+        else:
+            print(ttime)
+            break
+    # pd.DataFrame(pd_df).to_excel('./data/XBTfunding.xlsx' )
+    print('更新完成')
+def save_xbt8h(db_name,symbol):
+    # 生成所有的8小时K线数据
+    print('开始合成%s对应的8小时K线'%symbol)
+    client = pymongo.MongoClient(host='127.0.0.1', port=27017)
+    db_data = client[db_name]
+    db_data.drop_collection('XBTUSD8h')
+    db_collection = db_data[''.join([symbol, timeperiod])]
+    data_1h = list(db_collection.find())
+    db_8h_collection=db_data['XBTUSD8h']
+    j=0
+    while True:
+        list_8h=[ d for d in data_1h[j*8:j*8+8]]
+        df=pd.DataFrame(list_8h)
+        k_data={
+            'timestamp':df.iloc[0,5],
+            'open':str(df.iloc[0,4]),
+            'high':str(max(df['high'])),
+            'low':str(min(df['low'])),
+            'close':str(df.iloc[7,1])
+        }
+        db_8h_collection.insert_one(k_data)
+        j+=1
+        if j*8+8>len(data_1h):
+            break
+    print('合成完毕')
+
+def get_source_data(db_name):
+    # 获取所有8小时K线数据list
+    client = pymongo.MongoClient(host='127.0.0.1', port=27017)
+    db_data = client[db_name]
+    db_collection = db_data['XBTUSD8h']
+    cursor = db_collection.find()
+    data_list=list(cursor)
+    k_data_list=[]
+    for i in range(len(data_list)):
+        kd=[data_list[i]['open'],data_list[i]['close'],data_list[i]['low'],data_list[i]['high']]
+        k_data_list.append(kd)
+    return k_data_list
+
+def get_source_data_time(db_name):
+    # 获取所有8小时K线数据list，以及对应的时间轴
+    client = pymongo.MongoClient(host='127.0.0.1', port=27017)
+    db_data = client[db_name]
+    db_collection = db_data['XBTUSD8h']
+    cursor = db_collection.find()
+    data_list=list(cursor)
+    k_data_list=[]
+    time_data_list=[]
+    for i in range(len(data_list)):
+        kd=[data_list[i]['open'],data_list[i]['close'],data_list[i]['low'],data_list[i]['high']]
+        k_data_list.append(kd)
+        time_data_list.append(data_list[i]['timestamp'])
+    return k_data_list,time_data_list
+def get_fund_data(db_name):
+    # 生成所需的资金费率，返回对应的时间
+    client = pymongo.MongoClient(host='127.0.0.1', port=27017)
+    db_data = client[db_name]
+    db_collection = db_data['XBTfunding']
+    cursor = db_collection.find()
+    data_list=list(cursor)
+    fund_data_list=[]
+    time_list=[]
+    for i in range(len(data_list)):
+        kd=str(round(data_list[i]['fundingRate']*100,4))
+        fund_data_list.append(kd)
+        time_list.append(data_list[i]['timestamp'])
+    return fund_data_list,time_list
+
+def kline_profession_example(k_data,fund_data,day_data) -> Grid:
+    kline = (
+        Kline()
+            .add_xaxis(xaxis_data=day_data)
+            .add_yaxis(
+            series_name="BTC 8H_Kindex",
+            y_axis=k_data,
+            itemstyle_opts=opts.ItemStyleOpts(color0="#FF0000",
+                                              color="#2E8B57",
+                                              border_color0="#FF0000",
+                                              border_color="#2E8B57"),
+        )
+            .set_global_opts(
+            title_opts=opts.TitleOpts(
+                title="BTC的8H-K线",
+                subtitle="资金费率",
+            ),
+            xaxis_opts=opts.AxisOpts(type_="category"),
+            yaxis_opts=opts.AxisOpts(
+                is_scale=True,
+                splitarea_opts=opts.SplitAreaOpts(
+                    is_show=True, areastyle_opts=opts.AreaStyleOpts(opacity=1)
+                ),
+            ),
+            legend_opts=opts.LegendOpts(
+                is_show=True, pos_left='40%', pos_top='top'
+            ),
+            datazoom_opts=[
+                opts.DataZoomOpts(
+                    is_show=True,
+                    type_="inside",
+                    xaxis_index=[0, 1],
+                    range_start=0,
+                    range_end=100,
+                ),
+                opts.DataZoomOpts(
+                    is_show=True,
+                    xaxis_index=[0, 1],
+                    type_="slider",
+                    pos_top="90%",
+                    range_start=0,
+                    range_end=100,
+                ),
+            ],
+            tooltip_opts=opts.TooltipOpts(
+                trigger="axis",
+                axis_pointer_type="cross",
+                background_color="rgba(245, 245, 245, 0.8)",
+                formatter='',
+                border_width=1,
+                border_color="#ccc",
+                textstyle_opts=opts.TextStyleOpts(color="#000"),
+            ),
+            visualmap_opts=opts.VisualMapOpts(
+                is_show=False,
+                dimension=2,
+                series_index=5,
+                is_piecewise=True,
+                pieces=[
+                    {"value": 1, "color": "#ec0000"},
+                    {"value": -1, "color": "#00da3c"},
+                ],
+            ),
+            axispointer_opts=opts.AxisPointerOpts(
+                is_show=True,
+                link=[{"xAxisIndex": "all"}],
+                label=None
+            ),
+            brush_opts=opts.BrushOpts(
+                x_axis_index="all",
+                brush_link="all",
+                out_of_brush={"colorAlpha": 0.1},
+                brush_type="lineX",
+            ),
+        )
+    )
+    line = (
+        Line()
+            .add_xaxis(xaxis_data=day_data)
+            .add_yaxis(
+            series_name="capital_rate(%)",
+            y_axis=fund_data,
+            # y_axis=change_y(rate_data),
+            itemstyle_opts=opts.ItemStyleOpts(color="blue"),
+            is_smooth=False,
+            is_hover_animation=True,
+            linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.5),
+            # label_opts=opts.LabelOpts(is_show=True),
+            label_opts=opts.LabelOpts(is_show=True, formatter='{@[1]}%'),
+            is_symbol_show=False,
+        )
+            .set_global_opts(
+            xaxis_opts=opts.AxisOpts(
+                type_="category",
+                is_scale=True,
+                grid_index=1,
+                boundary_gap=True,
+                axisline_opts=opts.AxisLineOpts(is_on_zero=True),
+                axistick_opts=opts.AxisTickOpts(is_show=True),
+                splitline_opts=opts.SplitLineOpts(is_show=False),
+                axislabel_opts=opts.LabelOpts(is_show=True),
+                split_number=5,
+                min_="dataMin",
+                max_="dataMax",
+            ),
+            yaxis_opts=opts.AxisOpts(
+                grid_index=1,
+                is_scale=True,
+                split_number=4,
+                axislabel_opts=opts.LabelOpts(is_show=True),
+                axisline_opts=opts.AxisLineOpts(is_show=True),
+                axistick_opts=opts.AxisTickOpts(is_show=True),
+                splitline_opts=opts.SplitLineOpts(is_show=True),
+            ),
+            legend_opts=opts.LegendOpts(is_show=True, pos_right='30%', pos_top='top'),
+        )
+    )
+
+    grid_chart = Grid(
+        init_opts=opts.InitOpts(
+            width='1800px',
+            height='900px'
+        )
+    )
+    grid_chart.add(
+        kline,
+        grid_opts=opts.GridOpts(pos_left="10%", pos_right="8%", height="50%"),
+    )
+    grid_chart.add(
+        line,
+        grid_opts=opts.GridOpts(
+            pos_left="10%", pos_right="8%", pos_top="60%", height="30%"
+        ),
+    )
+    return grid_chart
+def draw_echarts(k_data,fund_data,day_list):
+    '''
+    利用pyecharts 画出K线图对应的资金费率情况变化
+    :param k_data:  XBTUSD的8小时K线数据 开收低高
+    :param fund_data:  对应的资金费率（例如：上午12点公布的资金费率值，对应到上午4点到中午12点的8hK线）
+    :param day_list:   对应的K线时间
+    :return:
+    '''
+    add_k=[
+    [455.29, 456.85, 454.69, 456.1],
+    [455.18, 458.92, 455.44, 459.5],
+    [457.1, 456.29, 456.2, 458.82],
+    [452.93, 453.2, 451.65, 454.38],
+    [453.55, 455.06, 453.2, 456.25],
+    [448.41, 447.1, 446.4, 449.18],
+    [440.99, 439.39, 440.75, 442.67],
+    [440, 440.62, 439.47, 441.7],
+    [440.61, 436.35, 434.81, 440.98],
+    [440.47, 441.27, 439.94, 441.61],
+    [442.92, 445.11, 442.93, 445.44],
+    [448.56, 446.83, 445.51, 449.58],
+    [451.51, 452.78, 450.46, 453.82],
+    [476.04, 475.5, 472.11, 485.95],
+    [500, 506.24, 497.89, 510.72],
+    [524.55, 555, 522.95, 541.98],
+    [546.4, 551.01, 533.64, 562],
+    [548.14, 534.72, 521.29, 551.08],
+    [537.84, 539.98, 534.38, 550.5],
+    [539.49, 538.82, 533.52, 541.88],
+    [557.01, 575.21, 556, 580.8]
+]+k_data
+    add_day=['2016/05/14 20:00:00', '2016/05/15 20:00:00', '2016/05/16 20:00:00', '2016/05/17 20:00:00',
+             '2016/05/18 20:00:00', '2016/05/19 20:00:00', '2016/05/20 20:00:00', '2016/05/21 20:00:00',
+             '2016/05/22 20:00:00', '2016/05/23 20:00:00', '2016/05/24 20:00:00', '2016/05/25 20:00:00',
+             '2016/05/26 20:00:00', '2016/05/27 20:00:00', '2016/05/28 20:00:00', '2016/05/29 20:00:00',
+             '2016/05/30 20:00:00', '2016/05/31 20:00:00', '2016/06/01 20:00:00', '2016/06/02 20:00:00',
+             '2016/06/03 20:00:00']+day_list
+    add_fund=[0.069, 0.0516, 0.0451, 0.0454, 0.0443, 0.0427, 0.0424, 0.042, 0.04, 0.0354, 0.0373, 0.0318, 0.0325,
+              0.0342, 0.035, 0.2588, 0.7046, 0.296, 0.1285, 0.0974, 0.0934]+fund_data
+    grid_chart=kline_profession_example(add_k,add_fund,add_day)
+    td=datetime.datetime.now().strftime('%Y%m%d-%H')
+    grid_chart.render('../html/8小时资金费率{}.html'.format(td))
+
+
+
+if __name__ == '__main__':
+
+    save_xbt1h(db_name,symbol)
+    save_funding(db_name)
+    save_xbt8h(db_name,symbol)
+
+    print('获取图表的K线数据')
+    k_data=get_source_data(db_name)
+    print('获得图表的资金费率数据,以及对应的时间轴数据')
+    fund_data,day_list=get_fund_data(db_name)
+    print('输出最新的资金费率 图表')
+    draw_echarts(k_data,fund_data,day_list)
