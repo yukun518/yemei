@@ -1,0 +1,586 @@
+import json,os
+import pandas as pd
+import pymongo
+import numpy as np
+import re,datetime
+import requests,sys
+
+
+from example.commons import Collector, Faker
+from pyecharts import options as opts
+from pyecharts.charts import Bar, Grid, Line, Kline, Page, Scatter
+
+os.environ['TF_CPP_MIN_LOG_LEVEL']='2'
+pd.set_option('display.max_columns',None)
+
+upColor = '#2E8B57'
+downColor = '#FF0000'
+linecolor1 = ''
+linecolor2 = ''
+last_fetch_time='2019-08-21'
+start_day='2015-09-25'
+
+XBT_name_list=['XBTUSD','XBTZ15','XBTH16','XBTM16','XBTU16','XBTZ16','XBTH17','XBTM17','XBTU17',
+               'XBTZ17','XBTH18','XBTM18','XBTU18','XBTZ18','XBTH19','XBTM19','XBTU19']
+
+timeperiod = '1d'
+db_name='BitmexKun'
+headers={
+'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)'
+             ' Chrome/75.0.3770.100 Safari/537.36'
+}
+
+def get_data(symbol,timeperiod,last_time=''):
+    '''
+    :param symbol: 合约名称
+            start_time:开始时间
+    :param timeperiod:  获取合约的周期,1d,1h等
+    :return: 返回获得数据，格式是json转换为python list
+    '''
+    if last_time:
+        k_data_url ="https://www.bitmex.com/api/v1/trade/bucketed?binSize=%s&partial=false&symbol=%s" \
+                    "&count=750&startTime=%s" % (timeperiod, symbol, last_time)
+    else:
+        k_data_url='https://www.bitmex.com/api/v1/trade/bucketed?binSize=%s&partial=false' \
+           '&symbol=%s&reverse=false&count=750'%(timeperiod,symbol)
+    response = requests.get(k_data_url, headers=headers)
+    r = response.json()
+    # print(r)
+    # print(type(r))
+    return r
+def get_lasttime(cursor):
+    '''
+    获取数据库的所有元素
+    :param cursor: 数据元素返回的列表
+    :return: 返回数据最后一条的时间
+    '''
+    if cursor:
+        data = list(cursor)
+    else:
+        data = []
+    try:
+        ttime = data[-1]['timestamp']
+    except Exception as e:
+        ttime = ""
+    return ttime
+
+
+def change_time(s):
+    '''
+    减少一天
+    :param s:
+    :return:
+    '''
+    pattern = re.compile(r'(.*)T.*.000Z')
+    m = pattern.findall(s)[0]
+    md=datetime.datetime.strptime(m,'%Y-%m-%d').date()-datetime.timedelta(1)
+    mt=datetime.datetime.strftime(md,'%Y-%m-%d')
+    return mt
+# change_time('2015-05-30T00:00:00.000Z')
+# sys.exit()
+def equal_day(sd,ed):
+    s_day=datetime.datetime.strptime(sd, '%Y-%m-%d').date()
+    e_day=datetime.datetime.strptime(ed, '%Y-%m-%d').date()
+    if s_day<e_day:
+        return False
+    else:
+        return True
+def big_day(sd,ed):
+    s_day = datetime.datetime.strptime(sd, '%Y-%m-%d').date()
+    e_day = datetime.datetime.strptime(ed, '%Y-%m-%d').date()
+    if s_day <= e_day:
+        return False
+    else:
+        return True
+# b=equal_day('2016-09-30','2015-09-25T00:00:00.000Z')
+# print(b)
+# sys.exit('90')
+def save_db(db_name,symbol):
+    client=pymongo.MongoClient(host='127.0.0.1',port=27017)
+    db_data=client[db_name]
+    db_collection=db_data[''.join([symbol,timeperiod])]
+    cursor = db_collection.find()
+    last_time=get_lasttime(cursor)
+    data=get_data(symbol, timeperiod,last_time)
+
+    pd_df=[]
+    while data !=None:
+        if last_time=='':
+            for d in data:
+                ttime = change_time(d['timestamp'])
+                k_data={
+                    'timestamp':ttime,
+                    'open':d['open'],
+                    'close':d['close'],
+                    'high':d['high'],
+                    'low':d['low']
+                }
+                print(ttime)
+                db_collection.insert_one(k_data)
+                pd_df.append(k_data)
+        else:
+            for d in data:
+                ttime=change_time(d['timestamp'])
+                if big_day(ttime,last_time):
+                    k_data = {
+                        'timestamp': ttime,
+                        'open': d['open'],
+                        'close': d['close'],
+                        'high': d['high'],
+                        'low': d['low']
+                    }
+                    print(ttime)
+                    db_collection.insert_one(k_data)
+                    pd_df.append(k_data)
+        last_time=ttime
+
+        if len(data)>=750:
+            data=get_data(symbol,timeperiod,last_time)
+            print('第二波循环抓取数据')
+        else:
+            break
+    pd.DataFrame(pd_df).to_excel('./data/%s_data.xlsx'%symbol)
+
+def get_source_data(symbol):
+    client = pymongo.MongoClient(host='127.0.0.1', port=27017)
+    db_data = client[db_name]
+    db_collection = db_data[''.join([symbol, timeperiod])]
+    cursor = db_collection.find()
+    data_list=[]
+    start=False
+    for d in cursor:
+        ttime=d['timestamp']
+        if start ==False:
+            start=equal_day(ttime,start_day)
+        if start:
+            data_list.append(d)
+    print(len(data_list))
+    client.close()
+    return data_list
+def get_xbt_data(start_time,end_time):
+    symbol='XBTUSD'
+    client = pymongo.MongoClient(host='127.0.0.1', port=27017)
+    db_data = client[db_name]
+    db_collection = db_data[''.join([symbol, timeperiod])]
+    cursor = db_collection.find()
+    data_list=[]
+    end=False
+    start=False
+    for df in cursor:
+        ttime=df['timestamp']
+        if  start_time==ttime :
+            start=True
+        if end_time==ttime :
+            data_list.append(df)
+            break
+        if start :
+            data_list.append(df)
+    client.close()
+    return data_list
+def get_k_data(data_list):
+    k_data_list=[]
+    for i in range(len(data_list)):
+        kd=[data_list[i]['open'],data_list[i]['close'],data_list[i]['low'],data_list[i]['high']]
+        k_data_list.append(kd)
+    return k_data_list
+def get_high_low(source,xbt):
+    data_list=[]
+    for i in range(len(source)):
+        high_value=(source[i]['high']-xbt[i]['high'])/xbt[i]['high']*100
+        low_value = (source[i]['low'] - xbt[i]['low']) / xbt[i]['low'] * 100
+        data_list.append([round(high_value,2),round(low_value,2)])
+    return data_list
+
+def get_day_list(source):
+    day_list=[]
+    for i in range(len(source)):
+        day_time=source[i]['timestamp']
+        day_list.append(day_time)
+    return day_list
+
+def draw_echarts(symbol,k_data,high_low_list,day_list,start_time,end_time):
+    '''
+    绘制K线数据是永续合约的开收低高数据
+    :param symbol: 定期合约
+    :param k_data: 永续合约的开收低高数据
+    :param high_low_list: 对应的高低比例
+    :param day_list: 对应的日期
+    :return:
+    '''
+    x_data=day_list
+    data=k_data
+    cha_data=high_low_list
+
+    def kline_profession_example() -> Grid:
+        kline = (
+            Kline()
+                .add_xaxis(xaxis_data=x_data)
+                .add_yaxis(
+                series_name="XBT的日K线",
+                y_axis=data,
+                itemstyle_opts=opts.ItemStyleOpts(color0="#FF0000",
+                                                  color="#2E8B57",
+                                                  border_color0="#FF0000",
+                                                  border_color="#2E8B57"),
+            )
+                .set_global_opts(
+                title_opts=opts.TitleOpts(
+                    title="XBT的日K线",
+                    subtitle="%s差值比例"%symbol,
+                ),
+                xaxis_opts=opts.AxisOpts(type_="category"),
+                yaxis_opts=opts.AxisOpts(
+                    is_scale=True,
+                    splitarea_opts=opts.SplitAreaOpts(
+                        is_show=True, areastyle_opts=opts.AreaStyleOpts(opacity=1)
+                    ),
+                ),
+                legend_opts=opts.LegendOpts(
+                    is_show=True, pos_left='40%', pos_top='top'
+                ),
+                datazoom_opts=[
+                    opts.DataZoomOpts(
+                        is_show=True,
+                        type_="inside",
+                        xaxis_index=[0, 1],
+                        range_start=0,
+                        range_end=100,
+                    ),
+                    opts.DataZoomOpts(
+                        is_show=True,
+                        xaxis_index=[0, 1],
+                        type_="slider",
+                        pos_top="90%",
+                        range_start=0,
+                        range_end=100,
+                    ),
+                ],
+                tooltip_opts=opts.TooltipOpts(
+                    trigger="axis",
+                    axis_pointer_type="cross",
+                    background_color="rgba(245, 245, 245, 0.8)",
+                    formatter='',
+                    border_width=1,
+                    border_color="#ccc",
+                    textstyle_opts=opts.TextStyleOpts(color="#000"),
+                ),
+                visualmap_opts=opts.VisualMapOpts(
+                    is_show=True,
+                    dimension=2,
+                    series_index=5,
+                    is_piecewise=True,
+                    pieces=[
+                        {"value": 1, "color": "#ec0000"},
+                        {"value": -1, "color": "#00da3c"},
+                    ],
+                ),
+                axispointer_opts=opts.AxisPointerOpts(
+                    is_show=True,
+                    link=[{"xAxisIndex": "all"}],
+                    # label=opts.LabelOpts(background_color="#777"),
+                    label=None
+                ),
+                brush_opts=opts.BrushOpts(
+                    x_axis_index="all",
+                    brush_link="all",
+                    out_of_brush={"colorAlpha": 0.1},
+                    brush_type="lineX",
+                ),
+            )
+        )
+
+        line = (
+            Line()
+                .add_xaxis(xaxis_data=x_data)
+                .add_yaxis(
+                series_name="最高价差值比例",
+                y_axis=[cha_data[i][0] for i in range(len(cha_data))],
+                # y_axis=change_y(rate_data),
+                itemstyle_opts=opts.ItemStyleOpts(color="green"),
+                is_smooth=False,
+                is_hover_animation=True,
+                linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.5),
+                # label_opts=opts.LabelOpts(is_show=True),
+                label_opts=opts.LabelOpts(is_show=True, position='top', formatter='{@[1]}%'),
+                is_symbol_show=False,
+            )
+                .add_yaxis(
+                series_name="最低价差值比例",
+                y_axis=[cha_data[i][1] for i in range(len(cha_data))],
+                # y_axis=change_y(rate_data),
+                itemstyle_opts=opts.ItemStyleOpts(color="red"),
+                is_smooth=False,
+                is_hover_animation=True,
+                linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.5),
+                # label_opts=opts.LabelOpts(is_show=True),
+                label_opts=opts.LabelOpts(is_show=True, position='bottom', formatter='{@[1]}%'),
+                is_symbol_show=False,
+            )
+                .set_global_opts(
+                xaxis_opts=opts.AxisOpts(
+                    type_="category",
+                    is_scale=True,
+                    grid_index=1,
+                    boundary_gap=True,
+                    axisline_opts=opts.AxisLineOpts(is_on_zero=True),
+                    axistick_opts=opts.AxisTickOpts(is_show=True),
+                    splitline_opts=opts.SplitLineOpts(is_show=False),
+                    axislabel_opts=opts.LabelOpts(is_show=True),
+                    split_number=5,
+                    min_="dataMin",
+                    max_="dataMax",
+                ),
+                yaxis_opts=opts.AxisOpts(
+                    grid_index=1,
+                    is_scale=True,
+                    split_number=4,
+                    axislabel_opts=opts.LabelOpts(is_show=True),
+                    axisline_opts=opts.AxisLineOpts(is_show=True),
+                    axistick_opts=opts.AxisTickOpts(is_show=True),
+                    splitline_opts=opts.SplitLineOpts(is_show=True),
+                ),
+                legend_opts=opts.LegendOpts(is_show=True, pos_right='30%', pos_top='top'),
+            )
+        )
+
+        grid_chart = Grid(
+            init_opts=opts.InitOpts(
+                width='1800px',
+                height='900px'
+            )
+        )
+        grid_chart.add(
+            kline,
+            grid_opts=opts.GridOpts(pos_left="10%", pos_right="8%", height="50%"),
+        )
+        grid_chart.add(
+            line,
+            grid_opts=opts.GridOpts(
+                pos_left="10%", pos_right="8%", pos_top="60%", height="30%"
+            ),
+        )
+        return grid_chart
+
+    kline_profession_example().render('../html/(%s-%s)定期%s永续对比.html'%(start_time,end_time,symbol))
+
+def draw_echarts_symbol(symbol,k_data,high_low_list,day_list,start_time,end_time):
+    '''
+    绘制K线数据是定期symbol合约的开收低高数据
+    :param symbol: 定期合约
+    :param k_data: 定期合约的开收低高数据
+    :param high_low_list:  对应的高低比例
+    :param day_list: 对应的日期
+    :return:
+    '''
+    x_data=day_list
+    data=k_data
+    cha_data=high_low_list
+
+
+    def kline_profession_example() -> Grid:
+        kline = (
+            Kline()
+                .add_xaxis(xaxis_data=x_data)
+                .add_yaxis(
+                series_name="%s的日K线"%symbol,
+                y_axis=data,
+                itemstyle_opts=opts.ItemStyleOpts(color0="#FF0000",
+                                                  color="#2E8B57",
+                                                  border_color0="#FF0000",
+                                                  border_color="#2E8B57"),
+            )
+                .set_global_opts(
+                title_opts=opts.TitleOpts(
+                    title="%s的日K线"%symbol,
+                    subtitle="%s差值比例"%symbol,
+                ),
+                xaxis_opts=opts.AxisOpts(type_="category"),
+                yaxis_opts=opts.AxisOpts(
+                    is_scale=True,
+                    splitarea_opts=opts.SplitAreaOpts(
+                        is_show=True, areastyle_opts=opts.AreaStyleOpts(opacity=1)
+                    ),
+                ),
+                legend_opts=opts.LegendOpts(
+                    is_show=True, pos_left='40%', pos_top='top'
+                ),
+                datazoom_opts=[
+                    opts.DataZoomOpts(
+                        is_show=True,
+                        type_="inside",
+                        xaxis_index=[0, 1],
+                        range_start=0,
+                        range_end=100,
+                    ),
+                    opts.DataZoomOpts(
+                        is_show=True,
+                        xaxis_index=[0, 1],
+                        type_="slider",
+                        pos_top="90%",
+                        range_start=0,
+                        range_end=100,
+                    ),
+                ],
+                tooltip_opts=opts.TooltipOpts(
+                    trigger="axis",
+                    axis_pointer_type="cross",
+                    background_color="rgba(245, 245, 245, 0.8)",
+                    formatter='',
+                    border_width=1,
+                    border_color="#ccc",
+                    textstyle_opts=opts.TextStyleOpts(color="#000"),
+                ),
+                visualmap_opts=opts.VisualMapOpts(
+                    is_show=False,
+                    dimension=2,
+                    series_index=5,
+                    is_piecewise=True,
+                    pieces=[
+                        {"value": 1, "color": "#ec0000"},
+                        {"value": -1, "color": "#00da3c"},
+                    ],
+                ),
+                axispointer_opts=opts.AxisPointerOpts(
+                    is_show=True,
+                    link=[{"xAxisIndex": "all"}],
+                    # label=opts.LabelOpts(background_color="#777"),
+                    label=None
+                ),
+                brush_opts=opts.BrushOpts(
+                    x_axis_index="all",
+                    brush_link="all",
+                    out_of_brush={"colorAlpha": 0.1},
+                    brush_type="lineX",
+                ),
+            )
+        )
+
+        line = (
+            Line()
+                .add_xaxis(xaxis_data=x_data)
+                .add_yaxis(
+                series_name="最高价差值比例",
+                y_axis=[cha_data[i][0] for i in range(len(cha_data))],
+                # y_axis=change_y(rate_data),
+                itemstyle_opts=opts.ItemStyleOpts(color="green"),
+                is_smooth=False,
+                is_hover_animation=True,
+                linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.5),
+                # label_opts=opts.LabelOpts(is_show=True),
+                label_opts=opts.LabelOpts(is_show=True, position='top', formatter='{@[1]}%'),
+                is_symbol_show=False,
+            )
+                .add_yaxis(
+                series_name="最低价差值比例",
+                y_axis=[cha_data[i][1] for i in range(len(cha_data))],
+                # y_axis=change_y(rate_data),
+                itemstyle_opts=opts.ItemStyleOpts(color="red"),
+                is_smooth=False,
+                is_hover_animation=True,
+                linestyle_opts=opts.LineStyleOpts(width=1, opacity=0.5),
+                # label_opts=opts.LabelOpts(is_show=True),
+                label_opts=opts.LabelOpts(is_show=True, position='bottom', formatter='{@[1]}%'),
+                is_symbol_show=False,
+            )
+                .set_global_opts(
+                xaxis_opts=opts.AxisOpts(
+                    type_="category",
+                    is_scale=True,
+                    grid_index=1,
+                    boundary_gap=True,
+                    axisline_opts=opts.AxisLineOpts(is_on_zero=True),
+                    axistick_opts=opts.AxisTickOpts(is_show=True),
+                    splitline_opts=opts.SplitLineOpts(is_show=False),
+                    axislabel_opts=opts.LabelOpts(is_show=True),
+                    split_number=5,
+                    min_="dataMin",
+                    max_="dataMax",
+                ),
+                yaxis_opts=opts.AxisOpts(
+                    grid_index=1,
+                    is_scale=True,
+                    split_number=4,
+                    axislabel_opts=opts.LabelOpts(is_show=True),
+                    axisline_opts=opts.AxisLineOpts(is_show=True),
+                    axistick_opts=opts.AxisTickOpts(is_show=True),
+                    splitline_opts=opts.SplitLineOpts(is_show=True),
+                ),
+                legend_opts=opts.LegendOpts(is_show=True, pos_right='30%', pos_top='top'),
+            )
+        )
+
+        grid_chart = Grid(
+            init_opts=opts.InitOpts(
+                width='1800px',
+                height='900px'
+            )
+        )
+        grid_chart.add(
+            kline,
+            grid_opts=opts.GridOpts(pos_left="10%", pos_right="8%", height="50%"),
+        )
+        grid_chart.add(
+            line,
+            grid_opts=opts.GridOpts(
+                pos_left="10%", pos_right="8%", pos_top="60%", height="30%"
+            ),
+        )
+        return grid_chart
+
+    kline_profession_example().render('../html/(%s-%s)定期K线%s对比.html'%(start_time,end_time,symbol))
+
+def save_all_data():
+    for symbol in XBT_name_list:
+        save_db(db_name,symbol)
+        print('%s已经存入数据库了'%symbol)
+
+def draw_all():
+
+    for symbol in XBT_name_list[1:]:
+        print('获取定期对永续的高低比例（K线是永续的）')
+        source_data = get_source_data(symbol)
+        print('获取定期合约%s的数据' % symbol, source_data)
+        start_time = source_data[0]['timestamp']
+        end_time = source_data[-1]['timestamp']
+        xbt_data = get_xbt_data(start_time, end_time)
+        high_low_data = get_high_low(source_data, xbt_data)
+        k_data = get_k_data(xbt_data)
+        day_list = get_day_list(source_data)
+        draw_echarts(symbol, k_data, high_low_data, day_list,start_time,end_time)
+        print('定期合约%s的图表已经生成了'%symbol)
+    print('*'*40)
+    for symbol in XBT_name_list[1:]:
+        print('获取定期对永续的高低比例（K线是定期的）')
+        source_data = get_source_data(symbol)
+        print('获取定期合约%s的数据' % symbol, source_data)
+        start_time = source_data[0]['timestamp']
+        end_time = source_data[-1]['timestamp']
+        xbt_data = get_xbt_data(start_time, end_time)
+        high_low_data = get_high_low(source_data, xbt_data)
+        k_data = get_k_data(source_data)
+        day_list = get_day_list(source_data)
+        draw_echarts_symbol(symbol, k_data, high_low_data, day_list,start_time,end_time)
+        print('定期K线合约%s的图表已经生成了'%symbol)
+if __name__ == '__main__':
+    save_all_data()
+    draw_all()
+    '''
+    symbol=XBT_name_list[3]
+    source_data=get_source_data(symbol)
+    print('获取定期合约%s的数据'%symbol,source_data)
+    start_time=source_data[0]['timestamp']
+    end_time=source_data[-1]['timestamp']
+    print('获取定期合约的开始时间%s，结束时间%s'%(start_time,end_time))
+    xbt_data=get_xbt_data(start_time,end_time)
+    print('获取永续合约的数据',xbt_data)
+    print('合成定期高点减去永续高点的差再除以永续的高点')
+    high_low_data=get_high_low(source_data,xbt_data)
+    print(type(high_low_data))
+    print('获得永续合约对应时间段的开收低高数据')
+    k_data=get_k_data(source_data)
+    print('获得定期合约的日期列表')
+    day_list=get_day_list(source_data)
+    print(day_list)
+    print('输出对应定期永续的图')
+    draw_echarts(symbol,k_data,high_low_data,day_list)
+    '''
